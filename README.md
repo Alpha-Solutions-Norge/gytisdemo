@@ -47,7 +47,3 @@ One physical seat cover is sold as five separate Shopify listings — one "mothe
 ## 8. Architecture diagram
 
 - Built an end-to-end flowchart (cart → checkout → order → Rackbeat → shipment → sync back) plus the mother/child SKU structure, published as a shareable diagram for internal use/presentation.
-
-## 9. GitHub connectivity
-
-- Fixed a 403 write-permission error blocking pushes to this repo — the configured token lacked sufficient scope. Resolved with a new classic personal access token (`repo` scope), which is how this file made it here.
