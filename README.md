@@ -30,28 +30,24 @@ One physical seat cover is sold as five separate Shopify listings — one "mothe
 - Root cause: a locale bug in Horizon's own filter component (`/collections/all`), unrelated to any store configuration, product data, or customization — confirmed by testing English vs. Norwegian.
 - Fixed by updating the live theme to **Horizon 4.2.0**. The update created a fresh unpublished copy that dropped our custom mother-SKU snippets (Shopify's update flow only merges editor settings, never hand-written code) — both snippets were reapplied before publishing.
 
-## 5. Live-theme direct-write investigation
-
-- Explored whether small theme edits could be applied directly instead of manual paste-in instructions. Confirmed this is blocked by Shopify itself: writing theme files requires a Shopify-granted per-app exemption beyond the `write_themes` scope, obtained through an external review process — not achievable in-session. Kept the manual-instructions workflow for the live theme.
-
-## 6. Thank You / Order Status pages — resolved
+## 5. Thank You / Order Status pages — resolved
 
 - The long-standing "stale content" symptom was never a CDN caching issue. Root cause: uninstalling/reinstalling the `mother-sku-cart-transform` app (done twice, for scope grants) silently cleared the Parent SKU block placements in the Checkout and Customer Accounts editors, with no error or indication. Re-adding both blocks fixed it immediately, confirmed on a real order.
 
-## 7. Order confirmation email — still open
+## 6. Order confirmation email — still open
 
 - The Parent SKU snippet is correctly saved in the live email template (confirmed by reading it directly via the API) and renders correctly via "Send test," but does not render on real, order-triggered emails — not even a trivial unconditional `{{ line.sku }}` debug line.
 - Ruled out: wrong template, a conflicting email app, and metafield-access restrictions.
 - Confirmed via research that this is a known, unresolved issue reported independently by other Shopify merchants, with no confirmed merchant-side fix. Next step queued: revert the template to default and re-paste the customization, then Shopify Support as the fallback.
 
-## 8. New product import
+## 7. New product import
 
 - Scraped and imported 7 "AirFresh" air-freshener products (51 scent variants total) from the real supplier site (gytisautek.no) into gytisdemo — one Shopify product per style with scent as a variant option, each variant keeping its real SKU, price, and image, tagged `car_make: Universal` to match the store's existing convention.
 
-## 9. Architecture diagram
+## 8. Architecture diagram
 
 - Built an end-to-end flowchart (cart → checkout → order → Rackbeat → shipment → sync back) plus the mother/child SKU structure, published as a shareable diagram for internal use/presentation.
 
-## 10. GitHub connectivity
+## 9. GitHub connectivity
 
 - Fixed a 403 write-permission error blocking pushes to this repo — the configured token lacked sufficient scope. Resolved with a new classic personal access token (`repo` scope), which is how this file made it here.
