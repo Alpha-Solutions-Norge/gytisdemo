@@ -1,3 +1,5 @@
+const { getChildrenFromIndex } = require("./family-index");
+
 const RACKBEAT_BASE = "https://app.rackbeat.com/api";
 const MOTHER_SKU_FIELD_ID = 2; // "Mother SKU" custom field, available_for: "item"
 
@@ -29,23 +31,14 @@ async function getOwnMotherSku(itemNumber) {
   return motherField ? motherField.value : null;
 }
 
-// This store's whole catalog is small (15 products as of 2026-09) - a full
-// scan on every event is cheap. Revisit if the catalog grows a lot.
+// Reads the persisted mother->children index (lib/family-index.js) instead of
+// scanning the catalog. The index is maintained incrementally by
+// api/product-webhook.js on Rackbeat's product.created/product.updated
+// events, so this stays O(1) regardless of catalog size - replaces an
+// earlier full-catalog-scan approach that started tripping Rackbeat's rate
+// limiter once the catalog grew past ~60 products.
 async function findChildrenOf(motherSku) {
-  const res = await fetch(`${RACKBEAT_BASE}/products?limit=200`, {
-    headers: rackbeatHeaders(),
-  });
-  const data = await res.json();
-  const children = [];
-
-  for (const product of data.products || []) {
-    const ownMother = await getOwnMotherSku(product.number);
-    if (ownMother === motherSku) {
-      children.push(product.number);
-    }
-  }
-
-  return children;
+  return getChildrenFromIndex(motherSku);
 }
 
 module.exports = {

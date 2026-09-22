@@ -8,6 +8,9 @@
     },
     "api/shopify-order-webhook.js": {
       "maxDuration": 30
+    },
+    "api/product-webhook.js": {
+      "maxDuration": 30
     }
   }
 }
