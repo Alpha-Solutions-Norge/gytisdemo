@@ -11,6 +11,9 @@
     },
     "api/product-webhook.js": {
       "maxDuration": 30
+    },
+    "api/admin-webhooks.js": {
+      "maxDuration": 30
     }
   }
 }
