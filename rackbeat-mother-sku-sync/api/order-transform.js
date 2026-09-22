@@ -83,14 +83,30 @@ module.exports = async (req, res) => {
     const order = await getOrder(orderNumber);
     const rewrites = [];
 
+    // Each line is handled independently, in its own try/catch: a failure on
+    // one line (e.g. the order getting booked mid-request, locking that
+    // specific line - a real race hit on 2026-09-22, see
+    // project_mother_sku_infrastructure memory) must never abort processing
+    // of the REMAINING lines. The original version threw out of the loop on
+    // the first failure, silently skipping every line after it - including,
+    // in that incident, the actual mother-SKU rewrite the whole function
+    // exists for. Lines are also sorted so mother-SKU rewrites (the
+    // stock-pooling-critical ones) are attempted before cut-length-only
+    // annotations (cosmetic/fulfillment-note only), so if time genuinely
+    // does run out before booking, the more important updates land first.
+    const candidates = [];
     for (const line of order.lines || []) {
       if (line.child_type !== "product") continue; // only products carry custom fields/Mother SKU
 
       const motherSku = await getOwnMotherSku(line.child_id);
       const cutLength = await getProductMetafieldForSku(line.child_id, "custom", "cut_length");
-
       if (!motherSku && !cutLength) continue; // nothing to annotate on this line
 
+      candidates.push({ line, motherSku, cutLength });
+    }
+    candidates.sort((a, b) => (b.motherSku ? 1 : 0) - (a.motherSku ? 1 : 0));
+
+    for (const { line, motherSku, cutLength } of candidates) {
       let newName = line.name;
       const soldAsSuffix = ` — sold as ${line.child_id}`;
       if (motherSku && !newName.includes(soldAsSuffix)) {
@@ -103,8 +119,12 @@ module.exports = async (req, res) => {
       const targetItemId = motherSku || line.child_id;
       if (targetItemId === line.child_id && newName === line.name) continue; // idempotent no-op on retry
 
-      const result = await updateLine(orderNumber, line, targetItemId, newName);
-      rewrites.push({ lineId: line.id, from: line.child_id, to: targetItemId, name: newName, result: "ok" });
+      try {
+        await updateLine(orderNumber, line, targetItemId, newName);
+        rewrites.push({ lineId: line.id, from: line.child_id, to: targetItemId, name: newName, result: "ok" });
+      } catch (lineError) {
+        rewrites.push({ lineId: line.id, from: line.child_id, to: targetItemId, error: String(lineError) });
+      }
     }
 
     res.status(200).json({ ok: true, order: orderNumber, rewrites });

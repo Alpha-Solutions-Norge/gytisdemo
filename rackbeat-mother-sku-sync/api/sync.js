@@ -5,6 +5,7 @@ const {
   getOwnMotherSku,
   findChildrenOf,
 } = require("../lib/rackbeat");
+const { acquireLock, releaseLock } = require("../lib/lock");
 
 const SHOP_DOMAIN = "gytisdemo.myshopify.com";
 
@@ -290,6 +291,8 @@ module.exports = async (req, res) => {
     return;
   }
 
+  let lockKey = null;
+
   try {
     // Symmetric handling: it doesn't matter whether the event came from the
     // mother's own stock changing or from one specific child's own stock
@@ -302,15 +305,35 @@ module.exports = async (req, res) => {
     const ownMotherSku = await getOwnMotherSku(item);
     const familyRoot = ownMotherSku || item;
     const children = await findChildrenOf(familyRoot);
-    const truth = await getStockTruth(item); // whichever item actually just changed is the freshest truth
 
     if (children.length === 0 && !ownMotherSku) {
-      // Genuinely standalone - no mother-SKU relationship either direction.
+      // Genuinely standalone - no mother-SKU relationship either direction,
+      // so there's no shared state to race on with another invocation.
+      const truth = await getStockTruth(item);
       const result = await correctShopifyStock(item, truth);
       res.status(200).json({ ok: true, item, truth, result });
       return;
     }
 
+    // Multiple real events for the SAME family can land within seconds of
+    // each other (e.g. several orders shipped in quick succession) and each
+    // spawns its own invocation of this handler. Without coordination, two
+    // overlapping invocations can each read a "truth" snapshot, then write
+    // to every member with no awareness of each other - interleaved writes
+    // from different passes drifted values into the hundreds on 2026-09-22
+    // (see project_mother_sku_infrastructure memory), even after fixing the
+    // separate location-selection bug. This lock ensures only one repool
+    // pass for this family runs at a time; a contended invocation fails
+    // loudly instead of racing, so Rackbeat's own webhook retry redelivers
+    // it later once the lock is free - reading genuinely fresh truth at that
+    // point, not silently dropping the event.
+    lockKey = `repool-lock:${familyRoot}`;
+    const gotLock = await acquireLock(lockKey);
+    if (!gotLock) {
+      throw new Error(`Could not acquire repool lock for ${familyRoot} - another pass is in progress`);
+    }
+
+    const truth = await getStockTruth(item); // read fresh, now that we hold the lock
     const allMembers = Array.from(new Set([familyRoot, ...children]));
 
     for (const member of allMembers) {
@@ -333,5 +356,7 @@ module.exports = async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: String(error) });
+  } finally {
+    if (lockKey) await releaseLock(lockKey);
   }
 };
