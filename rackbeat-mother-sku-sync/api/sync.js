@@ -47,42 +47,76 @@ async function createAndBookAdjustment(itemNumber, locationNumber, targetQuantit
   }
 }
 
-// Sets a family member's Rackbeat total to newTotal by adjusting only its
-// "home" location (whichever currently holds the most stock) - leaving any
-// other location's stock untouched. This is deliberately gentler than fully
-// consolidating onto one fixed location: the mother SKU can legitimately have
-// real stock split across multiple physical locations, and forcing it onto
-// one would destroy that. Works fine for children too, since they only ever
-// have stock at one location in practice.
+// The store's two real, physical warehouses. Every other "location" Rackbeat
+// returns for a product (numbered shelf/bin locations like "Hylle 12345", or
+// "Shop location") is internal bin-level metadata, not a place real stock
+// actually lives - see the 2026-09-22 cascade incident below for why this
+// matters.
+const REAL_WAREHOUSE_LOCATIONS = [1001, 1002];
+
+// Sets a family member's Rackbeat total to newTotal, fully consolidated onto
+// one "home" location among the two REAL warehouses - every other real
+// location (and any junk shelf/bin location) is left/zeroed out, never split.
+//
+// Home selection deterministically prefers 1001, falling back to 1002 only
+// if 1001 doesn't exist for this item - it does NOT pick "whichever
+// currently holds the most stock", and it does NOT leave other locations
+// untouched on the assumption they're already 0. Both of those looser
+// behaviors are what caused a real production incident on 2026-09-22: a
+// burst of several real order shipments in quick succession triggered
+// overlapping re-pool passes, each of which fired new inventory.changed
+// events for the members it corrected, re-triggering more passes. Junk
+// shelf/bin locations (Hylle 12345/12346/1-1-1, "Shop location") occasionally
+// held small stray balances, so "most stock" could flip to one of them; once
+// that happened, the delta math used other still-drifting locations as if
+// they were ground truth, compounding into four/five-digit garbage within
+// seconds. Restricting to the two real warehouses AND explicitly zeroing the
+// non-home one every pass removes the flip-flop entirely and guarantees
+// nothing is left to drift between passes, no matter how many times this
+// fires.
 async function setTotalAtHomeLocation(itemNumber, newTotal) {
   const locRes = await fetch(
     `${RACKBEAT_BASE}/products/${encodeURIComponent(itemNumber)}/locations`,
     { headers: rackbeatHeaders() }
   );
   const locData = await locRes.json();
-  const locations = locData.product_locations || [];
-  if (locations.length === 0) return;
-
-  const home = locations.reduce(
-    (best, loc) => (loc.stock_quantity > best.stock_quantity ? loc : best),
-    locations[0]
+  const realLocations = (locData.product_locations || []).filter((loc) =>
+    REAL_WAREHOUSE_LOCATIONS.includes(loc.number)
   );
-  const otherLocationsTotal = locations
-    .filter((loc) => loc.number !== home.number)
-    .reduce((sum, loc) => sum + loc.stock_quantity, 0);
-  const newHomeQuantity = newTotal - otherLocationsTotal;
+  if (realLocations.length === 0) return;
+
+  const home =
+    realLocations.find((loc) => loc.number === 1001) || realLocations[0];
+
+  // Fully consolidate onto `home` every pass - explicitly zero every other
+  // real location too, rather than trusting them to already be 0 and just
+  // computing a delta against an assumed-stable "other locations total".
+  // That assumption is what let a burst of overlapping corrections compound
+  // into four/five-digit garbage on 2026-09-22 (see
+  // project_mother_sku_infrastructure memory): each pass's home pick could
+  // flip, and once it did, the delta math used other still-drifting
+  // locations as if they were ground truth. Zeroing every non-home location
+  // every single pass guarantees nothing is left to drift or flip between,
+  // no matter how out-of-sync the starting state is or how many times this
+  // fires.
+  for (const loc of realLocations) {
+    if (loc.number === home.number) continue;
+    if (loc.stock_quantity !== 0) {
+      await createAndBookAdjustment(itemNumber, loc.number, 0, "Re-pool shared mother-SKU stock");
+    }
+  }
 
   // Rackbeat rejects a zero-delta adjustment as an error ("Adjustment can't be
   // created, since no change is made.") rather than accepting it as a no-op.
   // Redundant follow-up events (e.g. a child's own mirrored-change event
   // re-checking a mother that's already correct) are common under the
   // symmetric re-pool design above, so skip the write when nothing would change.
-  if (newHomeQuantity === home.stock_quantity) return;
+  if (newTotal === home.stock_quantity) return;
 
   await createAndBookAdjustment(
     itemNumber,
     home.number,
-    newHomeQuantity,
+    newTotal,
     "Re-pool shared mother-SKU stock"
   );
 }
@@ -167,17 +201,46 @@ async function correctShopifyStock(sku, targetQuantity) {
   if (levels.length === 0) return { sku, skipped: "no inventory levels in Shopify" };
 
   const currentTotal = levels.reduce((sum, l) => sum + l.quantity, 0);
-  if (currentTotal === targetQuantity) {
+  const home = levels.reduce((best, l) => (l.quantity > best.quantity ? l : best), levels[0]);
+  const alreadyConsolidated =
+    home.quantity === targetQuantity && levels.every((l) => l === home || l.quantity === 0);
+  if (currentTotal === targetQuantity && alreadyConsolidated) {
     return { sku, skipped: "already correct" };
   }
 
   // Don't assume a single fixed location - different products in this
-  // catalog live at different Shopify locations. Adjust whichever location
-  // already holds the item's stock, leaving any other (typically zero)
-  // location untouched, rather than guessing where the "right" place is.
-  const home = levels.reduce((best, l) => (l.quantity > best.quantity ? l : best), levels[0]);
-  const otherLocationsTotal = currentTotal - home.quantity;
-  const newHomeQuantity = targetQuantity - otherLocationsTotal;
+  // catalog live at different Shopify locations. Pick whichever location
+  // currently holds the most as "home", but fully consolidate onto it -
+  // setting it to the full target AND explicitly zeroing every other
+  // location in the same mutation - rather than just adjusting home and
+  // trusting the others to stay put.
+  //
+  // This isn't cosmetic: leaving other locations as an assumed-stable
+  // `otherLocationsTotal` is what let a burst of overlapping corrections
+  // compound into four/five-digit garbage on 2026-09-22 (see
+  // project_mother_sku_infrastructure memory) - each pass's "home" pick
+  // could flip between locations, and once that happened, the delta math
+  // used other still-drifting locations as if they were ground truth.
+  // Explicitly zeroing every non-home location every single pass guarantees
+  // exactly one location is ever nonzero after a correction, so there's
+  // nothing left to drift or flip between on the next pass, regardless of
+  // how many times this runs or how out-of-sync the starting state is.
+  const quantities = [
+    {
+      inventoryItemId,
+      locationId: home.locationId,
+      quantity: targetQuantity,
+      changeFromQuantity: home.quantity,
+    },
+    ...levels
+      .filter((l) => l !== home && l.quantity !== 0)
+      .map((l) => ({
+        inventoryItemId,
+        locationId: l.locationId,
+        quantity: 0,
+        changeFromQuantity: l.quantity,
+      })),
+  ];
 
   const result = await shopifyAdminGraphql(
     `mutation($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
@@ -190,14 +253,7 @@ async function correctShopifyStock(sku, targetQuantity) {
         name: "available",
         reason: "correction",
         referenceDocumentUri: `gid://rackbeat-mother-sku-sync/Correction/${sku}-${Date.now()}`,
-        quantities: [
-          {
-            inventoryItemId,
-            locationId: home.locationId,
-            quantity: newHomeQuantity,
-            changeFromQuantity: home.quantity,
-          },
-        ],
+        quantities,
       },
       idempotencyKey: crypto.randomUUID(),
     }
