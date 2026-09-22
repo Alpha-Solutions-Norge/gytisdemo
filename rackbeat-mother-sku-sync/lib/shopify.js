@@ -116,10 +116,35 @@ async function adjustAvailableDelta(inventoryItemId, locationId, delta, changeFr
   }
 }
 
+// Generic product metafield lookup by SKU - used e.g. to pull custom.cut_length
+// onto the Rackbeat-side order line for products that have it set.
+async function getProductMetafieldForSku(sku, namespace, key) {
+  const lookup = await shopifyAdminGraphql(
+    `query($q: String!, $namespace: String!, $key: String!) {
+      productVariants(first: 1, query: $q) {
+        edges {
+          node {
+            product {
+              metafield(namespace: $namespace, key: $key) { value }
+            }
+          }
+        }
+      }
+    }`,
+    { q: `sku:${sku}`, namespace, key }
+  );
+
+  const variant = lookup.data && lookup.data.productVariants.edges[0];
+  if (!variant) return null;
+  const metafield = variant.node.product.metafield;
+  return metafield ? metafield.value : null;
+}
+
 module.exports = {
   SHOP_DOMAIN,
   getShopifyAdminToken,
   shopifyAdminGraphql,
   getInventoryItemForSku,
   adjustAvailableDelta,
+  getProductMetafieldForSku,
 };

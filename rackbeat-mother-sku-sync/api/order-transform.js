@@ -1,13 +1,23 @@
 const { RACKBEAT_BASE, rackbeatHeaders, getOwnMotherSku } = require("../lib/rackbeat");
+const { getProductMetafieldForSku } = require("../lib/shopify");
 
 // Fires on Rackbeat's `order.created` event, before the order is ever booked
-// or shipped - the earliest safe point to intercept it. Rewrites any line
-// that was sold under a child SKU (e.g. GAFIA-ST017, one of 4 Shopify listings
-// for the same physical seat cover) to reference the mother item instead
-// (GAHOV-ST0066), so a shipment always decrements the pooled mother stock,
-// never a child's own independent ledger. This is what makes the reactive
-// re-pooling in sync.js mostly a safety net rather than the primary defense -
-// see project_mother_sku_infrastructure memory for the reactive half.
+// or shipped - the earliest safe point to intercept it. Two independent
+// per-line annotations happen here, both purely on the Rackbeat side (never
+// touching Shopify), since Rackbeat order lines have a fixed schema with no
+// custom fields of their own - the line's free-text `name` is the only place
+// to carry this:
+//
+// 1. Rewrites any line sold under a child SKU (e.g. GAFIA-ST017, one of 4
+//    Shopify listings for the same physical seat cover) to reference the
+//    mother item instead (GAHOV-ST0066), so a shipment always decrements the
+//    pooled mother stock, never a child's own independent ledger. This is
+//    what makes the reactive re-pooling in sync.js mostly a safety net rather
+//    than the primary defense - see project_mother_sku_infrastructure memory.
+// 2. Appends the product's `custom.cut_length` Shopify metafield (when set)
+//    onto the line name, so the warehouse sees it on the Rackbeat order -
+//    this is intentionally invisible on the Shopify side (cart, checkout,
+//    emails) since it's only relevant to fulfillment.
 async function getOrder(orderNumber) {
   const res = await fetch(
     `${RACKBEAT_BASE}/orders/${encodeURIComponent(orderNumber)}`,
@@ -20,18 +30,18 @@ async function getOrder(orderNumber) {
   return data.order;
 }
 
-async function rewriteLineToMother(orderNumber, line, motherSku) {
+async function updateLine(orderNumber, line, targetItemId, newName) {
   const res = await fetch(
     `${RACKBEAT_BASE}/orders/${encodeURIComponent(orderNumber)}/lines/${line.id}`,
     {
       method: "PUT",
       headers: rackbeatHeaders(),
       body: JSON.stringify({
-        item_id: motherSku,
+        item_id: targetItemId,
         // Preserve exactly what the customer actually bought and paid for -
         // swapping the item alone would otherwise reset pricing to the
-        // mother's own (internal, not customer-facing) sales price.
-        name: `${line.name} — sold as ${line.child_id}`,
+        // target item's own (internal, not customer-facing) sales price.
+        name: newName,
         line_price: line.line_price,
         discount_percentage: line.discount_percentage,
         vat_percentage: line.vat_percentage,
@@ -40,7 +50,7 @@ async function rewriteLineToMother(orderNumber, line, motherSku) {
   );
   const result = await res.json();
   if (!res.ok) {
-    throw new Error(`Failed to rewrite line ${line.id} on order ${orderNumber}: ${JSON.stringify(result)}`);
+    throw new Error(`Failed to update line ${line.id} on order ${orderNumber}: ${JSON.stringify(result)}`);
   }
   return result;
 }
@@ -74,12 +84,27 @@ module.exports = async (req, res) => {
     const rewrites = [];
 
     for (const line of order.lines || []) {
-      if (line.child_type !== "product") continue; // only products carry a Mother SKU field
-      const motherSku = await getOwnMotherSku(line.child_id);
-      if (!motherSku) continue; // already the mother, or a standalone product
+      if (line.child_type !== "product") continue; // only products carry custom fields/Mother SKU
 
-      const result = await rewriteLineToMother(orderNumber, line, motherSku);
-      rewrites.push({ lineId: line.id, from: line.child_id, to: motherSku, result: "ok" });
+      const motherSku = await getOwnMotherSku(line.child_id);
+      const cutLength = await getProductMetafieldForSku(line.child_id, "custom", "cut_length");
+
+      if (!motherSku && !cutLength) continue; // nothing to annotate on this line
+
+      let newName = line.name;
+      const soldAsSuffix = ` — sold as ${line.child_id}`;
+      if (motherSku && !newName.includes(soldAsSuffix)) {
+        newName = `${newName}${soldAsSuffix}`;
+      }
+      if (cutLength && !newName.includes("Cut-length:")) {
+        newName = `${newName} — Cut-length: ${cutLength}`;
+      }
+
+      const targetItemId = motherSku || line.child_id;
+      if (targetItemId === line.child_id && newName === line.name) continue; // idempotent no-op on retry
+
+      const result = await updateLine(orderNumber, line, targetItemId, newName);
+      rewrites.push({ lineId: line.id, from: line.child_id, to: targetItemId, name: newName, result: "ok" });
     }
 
     res.status(200).json({ ok: true, order: orderNumber, rewrites });
