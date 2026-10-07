@@ -52,3 +52,10 @@ One physical seat cover is sold as five separate Shopify listings — one "mothe
 
 - Built an interactive checklist for setting up a limited Shopify staff role for a prospective client to browse the gytisdemo backend — enough access to look around and add a product, nothing financial, destructive, or touching real customer data. Maps the intent to Shopify's actual permission toggles (Products, Inventory, Online Store, Analytics, Orders, Customers), with per-viewer progress tracking as it's applied in the Shopify role editor.
 - [Prospect Demo Role checklist](https://claude.ai/artifact/AiheyM9mLWkuoPSG2ooQDd)
+
+## 10. Consolidated multi-order picking list (`rackbeat-mother-sku-sync/api/picking-list.js`, new)
+
+- Rackbeat has no native way to combine several orders into one picking list — confirmed via its own help docs ("Each shipment will have its own picking list and packing slip") and a live API check (no `/picking-lists` endpoint, and `/orders` only supports filtering by `number`/`created_at`/`updated_at`).
+- New endpoint pulls the oldest N booked-but-unshipped orders (the real "ready to pick" queue), merges their lines by warehouse location (natural-sorted — Rackbeat has no explicit pick-route field, so the walking order follows your location *names*), and sums each item's quantity across all selected orders with a per-order breakdown for packing afterward.
+- Renders a plain printable HTML page: `GET /api/picking-list?secret=...&count=10`.
+- Verified the merge/aggregation logic against real order data — quantities and per-order attribution both correct.
